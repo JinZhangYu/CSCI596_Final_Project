@@ -329,19 +329,47 @@ class YOLOXHead(YOLOv5Head):
                                                 flatten_bbox_preds,
                                                 flatten_priors[..., 2])
 
-        (pos_masks, cls_targets, obj_targets, bbox_targets, bbox_aux_target,
-         num_fg_imgs) = multi_apply(
-             self._get_targets_single,
-             flatten_priors.unsqueeze(0).repeat(num_imgs, 1, 1),
-             flatten_cls_preds.detach(), flatten_bboxes.detach(),
-             flatten_objectness.detach(), batch_gt_instances, batch_img_metas,
-             batch_gt_instances_ignore)
+        # Method1: Using for loop to iterate over all image within batch, which is
+        # quite slow compared with model forward and backward.
+        # (pos_masks, cls_targets, obj_targets, bbox_targets, bbox_aux_targets,
+        #  reid_targets, objflow_targets, dataset_sources, num_fg_imgs) = multi_apply(
+        #     self._get_targets_single,
+        #     flatten_priors.unsqueeze(0).repeat(num_imgs, 1, 1),
+        #     flatten_cls_preds.detach(), flatten_bboxes.detach(),
+        #     flatten_objectness.detach(),
+        #     batch_gt_instances, batch_img_metas,
+        #     batch_gt_instances_ignore)
+
+        # pos_masks = torch.cat(pos_masks, 0)
+        # cls_targets = torch.cat(cls_targets, 0)
+        # obj_targets = torch.cat(obj_targets, 0)
+        # bbox_targets = torch.cat(bbox_targets, 0)
+        # bbox_aux_targets = torch.cat(bbox_aux_targets, 0)
+        # reid_targets = torch.cat(reid_targets, 0)
+        # objflow_targets = torch.cat(objflow_targets, 0)
+        # dataset_sources = torch.cat(dataset_sources, 0)
+        # num_pos = torch.tensor(
+        #     sum(num_fg_imgs),
+        #     dtype=torch.float,
+        #     device=flatten_cls_preds.device)
+
+        # Method2: Combining batch images within one image along width, then get targets.
+        # Disable AMP autocast and get targets with FP32 to avoid overflow. For example,
+        # 10000. + 4. is not 10004. in torch.float16, its 10000, so we convert priors to
+        # float32. But this methods requires huge amount of cuda memory, so its also not
+        # possible to use this method when batchsize is large.
+        (pos_masks, cls_targets, obj_targets, bbox_targets, bbox_aux_targets,
+         reid_targets, objflow_targets, dataset_sources, num_pos) = self._get_targets(
+            flatten_priors.unsqueeze(0).repeat(num_imgs, 1, 1).float(),
+            flatten_cls_preds.float().detach(), flatten_bboxes.float().detach(),
+            flatten_objectness.float().detach(),
+            batch_gt_instances, batch_img_metas,
+            batch_gt_instances_ignore)
 
         # The experimental results show that 'reduce_mean' can improve
         # performance on the COCO dataset.
         num_pos = torch.tensor(
-            sum(num_fg_imgs),
-            dtype=torch.float,
+            num_pos, dtype=torch.float,
             device=flatten_cls_preds.device)
         num_total_samples = max(reduce_mean(num_pos), 1.0)
 
@@ -386,6 +414,87 @@ class YOLOXHead(YOLOv5Head):
             loss_dict.update(loss_bbox_aux=loss_bbox_aux)
 
         return loss_dict
+
+    @torch.no_grad()
+    def _get_targets(
+            self,
+            priors: Tensor,
+            cls_preds: Tensor,
+            decoded_bboxes: Tensor,
+            objectness: Tensor,
+            gt_instances: Sequence[InstanceData],
+            img_meta: dict,
+            gt_instances_ignore: Optional[Sequence[InstanceData]] = None) -> tuple:
+        """Compute classification, regression, and objectness targets for
+        priors in a single image.
+
+        Args:
+            priors (Tensor): All priors of multiple image, a 2D-Tensor with shape
+                [num_imgs, num_priors, 4] in [cx, xy, stride_w, stride_y] format.
+            cls_preds (Tensor): Classification predictions of multiple image,
+                a 2D-Tensor with shape [num_imgs, num_priors, num_classes]
+            decoded_bboxes (Tensor): Decoded bboxes predictions of multiple image,
+                a 2D-Tensor with shape [num_imgs, num_priors, 4] in [tl_x, tl_y,
+                br_x, br_y] format.
+            objectness (Tensor): Objectness predictions of multiple image,
+                a 1D-Tensor with shape [num_imgs, num_priors]
+            gt_instances (Sequence[`InstanceData`]): Ground truth of instance
+                annotations. It should includes ``bboxes`` and ``labels``
+                attributes.
+            img_meta (dict): Meta information for current image.
+            gt_instances_ignore (Sequence[`InstanceData`], optional): Instances
+                to be ignored during training. It includes ``bboxes`` attribute
+                data that is ignored during training and testing.
+                Defaults to None.
+        Returns:
+            tuple:
+                foreground_mask (list[Tensor]): Binary mask of foregroundtargets.
+                cls_target (list[Tensor]): Classification targets of an image.
+                obj_target (list[Tensor]): Objectness targets of an image.
+                bbox_target (list[Tensor]): BBox targets of an image.
+                bbox_aux_target (int): BBox aux targets of an image.
+                reid_target (list[Tensor]): ReID embedding targets of an image.
+                objflow_target (list[Tensor]): Object flow targets of an image.
+                dataset_source (list[Tensor]): Source dataset id of each bbox.
+                num_pos_per_img (int): Number of positive samples in an image.
+        """
+        num_imgs = len(img_meta)
+
+        # Original get_targets is using multi_apply, which means looping over all images.
+        # For example, if our batchsize is 12 and we both have current and reference
+        # frames, then we need to loop for 24 times, which is almost 50% of the training
+        # time. So we combine all images into one image along width, thus we only need
+        # to run get_targets_single once.
+        priors_modified = priors.clone()
+        decoded_bboxes_modified = decoded_bboxes.clone()
+
+        # Most of the time, image will not have such a large width 5000, so its safe.
+        restart_widths = torch.arange(0, num_imgs, dtype=priors.dtype,
+                                      device=priors.device) * 5000
+        assert num_imgs <= 12, f'num_imgs={num_imgs} should be less than or equal to 12, ' \
+            f'otherwise it might exceed the range of half precision.'
+        priors_modified[...,0] += restart_widths.view(-1,1)
+        decoded_bboxes_modified[...,0::2] += restart_widths.view(-1,1,1)
+
+        # Convert gt. The reason why we have to use for loop is because each image has
+        # different number of bboxes.
+        gt_instances_modified = copy.deepcopy(gt_instances)
+        gt_instances_ignore_modified = copy.deepcopy(gt_instances_ignore)
+        for i in range(num_imgs):
+            gt_instances_modified[i]['bboxes'][..., 0::2] += restart_widths[i]
+            if 'bboxes' in gt_instances_ignore_modified[i]:
+                gt_instances_ignore_modified[i]['bboxes'][..., 0::2] += restart_widths[i]
+
+        gt_instances = gt_instances[0].cat(gt_instances)
+        gt_instances_ignore = gt_instances_ignore[0].cat(gt_instances_ignore)
+        gt_instances_modified = gt_instances_modified[0].cat(gt_instances_modified)
+        gt_instances_ignore_modified = gt_instances_ignore_modified[0].cat(gt_instances_ignore_modified)
+
+        # Get targets
+        return self._get_targets_single(priors_modified.view(-1, 4), cls_preds.view(-1, 1),
+                                        decoded_bboxes_modified.view(-1, 4), objectness.view(-1),
+                                        gt_instances_modified, None, gt_instances_ignore_modified,
+                                        priors.view(-1, 4), decoded_bboxes.view(-1, 4), gt_instances)
 
     @torch.no_grad()
     def _get_targets_single(
